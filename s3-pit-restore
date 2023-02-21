@@ -186,21 +186,23 @@ def signal_handler(signal, frame):
             futures.pop(future, None)
     print("Gracefully exiting ...")
 
-def print_obj(obj, optional_message=""):
-    if args.verbose:
-        print('"%s" %s %s %s %s %s' % (obj["LastModified"], obj["VersionId"], obj["Size"], obj["StorageClass"], obj["Key"], optional_message))
+def print_better(message, src_bucket, src_file, dest_bucket="", dest_file=""):
+    if not dest_bucket and not dest_file:
+        print('[%s] s3://%s/%s' % (message, src_bucket, src_file))
+    elif not dest_file:
+        print('[%s] s3://%s/%s -> %s' % (message, src_bucket, src_file, dest_file))
     else:
-        print(obj["Key"])
+        print('[%s] s3://%s/%s -> s3://%s/%s' % (message, src_bucket, src_file, dest_bucket, dest_file))
 
 def handled_by_glacier(obj):
     if (obj["StorageClass"] == "DEEP_ARCHIVE" or obj["StorageClass"] == "GLACIER") and not args.enable_glacier:
-        print_obj(obj, optional_message='needs restore')
+        print_better('Glacier - Needs restore but glacier not enabled', args.bucket, obj["Key"])
         return True
     elif (obj["StorageClass"] == "DEEP_ARCHIVE" or obj["StorageClass"] == "GLACIER") and args.enable_glacier:
         s3 = boto3.resource('s3', endpoint_url=args.endpoint_url)
         s3_obj = s3.Object(args.bucket, obj["Key"])
         if s3_obj.restore is None:
-            print_obj(obj, optional_message='requesting')
+            print_better('Glacier - requesting restore', args.bucket, obj["Key"])
             if not args.dry_run:
                 try:
                     s3_obj.restore_object(VersionId=obj["VersionId"], RestoreRequest={'Days': 3},)
@@ -210,17 +212,18 @@ def handled_by_glacier(obj):
             return True
         # Print out objects whose restoration is on-going
         elif 'ongoing-request="true"' in s3_obj.restore:
-            print_obj(obj, optional_message='in-progress')
+            print_better('Glacier - restore in progress', args.bucket, obj["Key"])
             return True
         # Print out objects whose restoration is complete
         elif 'ongoing-request="false"' in s3_obj.restore:
+            print_better('Glacier - restore complete', args.bucket, obj["Key"])
             return False
     else:
         return False
 
 def handled_by_standard(obj):
     if args.dry_run:
-        print_obj(obj)
+        print_better('Dry run - Standard', args.bucket, obj["Key"])
     else:
         if obj["Key"].endswith("/"):
             if not os.path.exists(obj["Key"]):
@@ -239,7 +242,7 @@ def handled_by_standard(obj):
 
 def handled_by_copy(obj):
     if args.dry_run:
-        print_obj(obj)
+        print_better('Dry run - COPY', args.bucket, obj["Key"], args.dest_bucket, get_key(obj))
         return True
     future = executor.submit(s3_copy_object, obj)
     global futures
@@ -247,6 +250,7 @@ def handled_by_copy(obj):
     return True
 
 def download_file(obj):
+    print_better('Downloading', args.bucket, obj["Key"], args.dest)
     transfer.download_file(args.bucket, obj["Key"], obj["Key"], extra_args={"VersionId": obj["VersionId"]})
     unixtime = time.mktime(obj["LastModified"].timetuple())
     os.utime(obj["Key"],(unixtime, unixtime))
@@ -267,12 +271,14 @@ def s3_copy_object(obj):
 
     if args.sse is not None:
         extra_args['ServerSideEncryption'] = args.sse
+    dest = get_key(obj)
+    print_better('Copying', args.bucket, obj["Key"], args.dest_bucket, dest)
 
-    client.copy(Bucket=args.dest_bucket, CopySource=copy_source, Key=get_key(obj), ExtraArgs=extra_args)
+    client.copy(Bucket=args.dest_bucket, CopySource=copy_source, Key=dest, ExtraArgs=extra_args)
 
 def handled_by_delete(obj):
     if args.dry_run:
-        print_obj(obj)
+        print_better('Dry run - DELETE', args.dest_bucket, obj["Key"])
         return True
     future = executor.submit(s3_delete_object, obj)
     global futures
@@ -280,6 +286,7 @@ def handled_by_delete(obj):
     return True
 
 def s3_delete_object(obj):
+    print_better('Deleting', args.dest_bucket, obj["Key"])
     client.delete_object(Bucket=args.dest_bucket, Key=obj["Key"])
 
 def do_restore():
@@ -369,7 +376,7 @@ def do_restore():
             if future in futures:
                 try:
                     future.result()
-                    print_obj(futures[future])
+                    print_better('Transfer Complete', args.bucket, futures[future]["Key"], args.dest, futures[future]["Key"])
                 except Exception as ex:
                     print('"%s" %s %s %s %s "ERROR: %s"' % (obj["LastModified"], obj["VersionId"], obj["Size"], obj["StorageClass"], obj["Key"], ex), file=sys.stderr)
                 del(futures[future])
@@ -381,7 +388,7 @@ def do_restore():
             if future in futures:
                 try:
                     future.result()
-                    print_obj(futures[future])
+                    print_better('Delete Complete', args.bucket, futures[future]["Key"], args.dest, futures[future]["Key"])
                 except Exception as ex:
                     print('"%s" %s %s %s %s "ERROR: %s"' % (obj["LastModified"], obj["VersionId"], obj["Size"], obj["StorageClass"], obj["Key"], ex))
                 del(futures[future])
